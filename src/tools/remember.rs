@@ -12,4 +12,7 @@ pub struct RememberParams {
     /// Related file paths for context
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    /// Tags for additional categorization
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
