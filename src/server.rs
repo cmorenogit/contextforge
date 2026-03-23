@@ -7,6 +7,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
+use crate::code_intel::CodeScanner;
 use crate::embeddings::LazyEmbeddingEngine;
 use crate::storage::local::LocalStorage;
 use crate::tools::{ContextParams, RecallParams, RememberParams, ScanParams};
@@ -129,12 +130,30 @@ impl ContextForgeServer {
         )]))
     }
 
-    #[tool(description = "Scan codebase structure and git history. Stub — not yet implemented.")]
+    #[tool(
+        description = "Scan codebase structure (tree-sitter) and git history (gitoxide). Extracts functions, classes, structs, imports, and recent commits."
+    )]
     async fn scan(&self, params: Parameters<ScanParams>) -> Result<CallToolResult, McpError> {
-        let path = params.0.path.as_deref().unwrap_or(".");
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "[stub] Would scan: {path}"
-        ))]))
+        let p = params.0;
+        let root = std::path::PathBuf::from(p.path.as_deref().unwrap_or("."));
+        let patterns = p.patterns.unwrap_or_default();
+
+        let mut scanner = CodeScanner::new();
+        let summary = scanner
+            .scan(
+                &root,
+                &patterns,
+                p.include_git,
+                p.max_commits as usize,
+                &self.storage,
+            )
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let response = serde_json::to_string_pretty(&summary)
+            .unwrap_or_else(|_| format!("Scanned {} files", summary.files_scanned));
+
+        Ok(CallToolResult::success(vec![Content::text(response)]))
     }
 
     #[tool(

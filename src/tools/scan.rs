@@ -1,6 +1,10 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+fn default_max_commits() -> u32 {
+    200
+}
+
 /// Parameters for the `scan` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScanParams {
@@ -13,4 +17,7 @@ pub struct ScanParams {
     /// Whether to include git history analysis
     #[serde(default)]
     pub include_git: bool,
+    /// Maximum number of git commits to analyze (default: 200)
+    #[serde(default = "default_max_commits")]
+    pub max_commits: u32,
 }

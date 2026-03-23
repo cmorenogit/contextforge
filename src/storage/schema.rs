@@ -68,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)
 
 /// All schema statements in order.
 pub const MIGRATIONS: &[&str] = &[
+    // V1: memories (CF-02)
     CREATE_MEMORIES_TABLE,
     CREATE_FTS_TABLE,
     CREATE_VECTOR_INDEX,
@@ -76,8 +77,67 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE_FTS_UPDATE_TRIGGER,
     CREATE_CATEGORY_INDEX,
     CREATE_CREATED_AT_INDEX,
+    // V2: code intelligence (CF-03)
+    CREATE_CODE_SYMBOLS_TABLE,
+    CREATE_SYMBOLS_FILE_INDEX,
+    CREATE_SYMBOLS_NAME_INDEX,
+    CREATE_SYMBOLS_KIND_INDEX,
+    CREATE_SCAN_STATE_TABLE,
+    CREATE_GIT_COMMITS_TABLE,
+    CREATE_COMMITS_TYPE_INDEX,
+    CREATE_COMMITS_DATE_INDEX,
 ];
 
 /// Migration: add embedding_model column to existing databases.
-pub const ADD_EMBEDDING_MODEL_COLUMN: &str =
-    "ALTER TABLE memories ADD COLUMN embedding_model TEXT";
+pub const ADD_EMBEDDING_MODEL_COLUMN: &str = "ALTER TABLE memories ADD COLUMN embedding_model TEXT";
+
+// --- CF-03: Code Intelligence tables ---
+
+/// Code symbols extracted by tree-sitter.
+pub const CREATE_CODE_SYMBOLS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS code_symbols (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path  TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line   INTEGER NOT NULL,
+    signature  TEXT,
+    file_hash  TEXT NOT NULL
+)
+"#;
+
+pub const CREATE_SYMBOLS_FILE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_symbols_file ON code_symbols(file_path)";
+pub const CREATE_SYMBOLS_NAME_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_symbols_name ON code_symbols(name)";
+pub const CREATE_SYMBOLS_KIND_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_symbols_kind ON code_symbols(kind)";
+
+/// Incremental scan state — tracks file content hashes.
+pub const CREATE_SCAN_STATE_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS scan_state (
+    file_path    TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    scanned_at   TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"#;
+
+/// Git commits parsed from repository history.
+pub const CREATE_GIT_COMMITS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS git_commits (
+    hash         TEXT PRIMARY KEY,
+    message      TEXT NOT NULL,
+    author       TEXT,
+    committed_at TEXT,
+    commit_type  TEXT,
+    scope        TEXT,
+    breaking     INTEGER DEFAULT 0,
+    files_changed TEXT
+)
+"#;
+
+pub const CREATE_COMMITS_TYPE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_commits_type ON git_commits(commit_type)";
+pub const CREATE_COMMITS_DATE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_commits_date ON git_commits(committed_at)";

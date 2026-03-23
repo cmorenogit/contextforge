@@ -19,6 +19,12 @@ pub enum ContextForgeError {
     #[error("Embedding error: {0}")]
     Embedding(String),
 
+    #[error("Parse error: {0}")]
+    Parse(String),
+
+    #[error("Git error: {0}")]
+    Git(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

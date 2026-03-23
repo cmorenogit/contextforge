@@ -49,13 +49,10 @@ impl LocalStorage {
         }
 
         // Migration: add embedding_model column if missing (existing databases)
-        if let Err(_) = self
+        let _ = self
             .conn
             .execute(schema::ADD_EMBEDDING_MODEL_COLUMN, ())
-            .await
-        {
-            // Column already exists — safe to ignore
-        }
+            .await;
 
         Ok(())
     }
@@ -506,6 +503,121 @@ impl LocalStorage {
         } else {
             Ok(0)
         }
+    }
+    // --- CF-03: Code Intelligence storage methods ---
+
+    /// Get the content hash for a file from scan state.
+    pub async fn get_scan_hash(&self, file_path: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT content_hash FROM scan_state WHERE file_path = ?1",
+                libsql::params![file_path],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let hash: String = row
+                .get(0)
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            Ok(Some(hash))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Insert or update scan state for a file.
+    pub async fn upsert_scan_state(&self, file_path: &str, content_hash: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO scan_state (file_path, content_hash) VALUES (?1, ?2) \
+                 ON CONFLICT(file_path) DO UPDATE SET content_hash = ?2, scanned_at = datetime('now')",
+                libsql::params![file_path, content_hash],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete all symbols for a file (before re-parsing).
+    pub async fn delete_symbols_for_file(&self, file_path: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM code_symbols WHERE file_path = ?1",
+                libsql::params![file_path],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Store parsed symbols for a file.
+    pub async fn store_symbols(
+        &self,
+        file_path: &str,
+        symbols: &[crate::code_intel::parser::Symbol],
+        file_hash: &str,
+    ) -> Result<()> {
+        for sym in symbols {
+            self.conn
+                .execute(
+                    "INSERT INTO code_symbols (file_path, name, kind, start_line, end_line, signature, file_hash) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    libsql::params![
+                        file_path,
+                        sym.name.clone(),
+                        sym.kind.to_string(),
+                        sym.start_line as i64,
+                        sym.end_line as i64,
+                        sym.signature.clone(),
+                        file_hash
+                    ],
+                )
+                .await
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Store git commits (upsert — skip duplicates).
+    pub async fn store_commits(
+        &self,
+        commits: &[crate::code_intel::git::CommitInfo],
+    ) -> Result<()> {
+        for commit in commits {
+            let (commit_type, scope, breaking) = match &commit.conventional {
+                Some(cc) => (
+                    Some(cc.commit_type.clone()),
+                    cc.scope.clone(),
+                    cc.breaking as i32,
+                ),
+                None => (None, None, 0),
+            };
+
+            self.conn
+                .execute(
+                    "INSERT INTO git_commits (hash, message, author, committed_at, commit_type, scope, breaking, files_changed) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]') \
+                     ON CONFLICT(hash) DO NOTHING",
+                    libsql::params![
+                        commit.hash.clone(),
+                        commit.message.clone(),
+                        commit.author.clone(),
+                        commit.committed_at.clone(),
+                        commit_type,
+                        scope,
+                        breaking
+                    ],
+                )
+                .await
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 
