@@ -7,10 +7,13 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
-use crate::code_intel::CodeScanner;
 use crate::embeddings::LazyEmbeddingEngine;
 use crate::storage::local::LocalStorage;
-use crate::tools::{ContextParams, RecallParams, RememberParams, ScanParams};
+use crate::tools::{
+    MemoryContextParams, MemoryForgetParams, MemoryInspectParams, MemorySaveParams,
+    MemorySearchParams, MemorySessionEndParams, MemorySessionStartParams,
+    MemorySessionSummaryParams, MemoryUpdateParams,
+};
 
 #[derive(Clone)]
 pub struct ContextForgeServer {
@@ -30,7 +33,6 @@ fn detect_project_scope() -> String {
 
 #[tool_router]
 impl ContextForgeServer {
-    /// Create server with the given storage backend.
     pub fn with_storage(storage: Arc<LocalStorage>) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -39,27 +41,26 @@ impl ContextForgeServer {
         }
     }
 
+    // ── memory_save ──────────────────────────────────────────────────────
+
     #[tool(
-        description = "Remember a decision, pattern, or discovery. Stores it with semantic embedding for later recall."
+        description = "Save a decision, pattern, discovery, or convention to memory with semantic embedding."
     )]
-    async fn remember(
+    async fn memory_save(
         &self,
-        params: Parameters<RememberParams>,
+        params: Parameters<MemorySaveParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
 
-        // Generate embedding (graceful degradation: store without if it fails)
         let embedding = match self.embeddings.embed(&p.content).await {
             Ok(emb) => Some(emb),
             Err(e) => {
-                tracing::warn!("Embedding generation failed, storing without vector: {e}");
+                tracing::warn!("Embedding generation failed: {e}");
                 None
             }
         };
 
         let model_id = self.embeddings.model_id().map(|s| s.to_string());
-
-        // Auto-detect scope: user override > project auto-detect
         let scope = p.scope.unwrap_or_else(detect_project_scope);
 
         let memory = self
@@ -81,7 +82,6 @@ impl ContextForgeServer {
             "status": "stored",
             "scope": scope,
             "category": memory.category,
-            "files": memory.files,
             "created_at": memory.created_at.to_rfc3339(),
         });
 
@@ -91,15 +91,18 @@ impl ContextForgeServer {
         )]))
     }
 
+    // ── memory_search ────────────────────────────────────────────────────
+
     #[tool(
-        description = "Recall relevant context using hybrid search (keyword + semantic). Returns memories ranked by relevance."
+        description = "Search memories using hybrid semantic + keyword search. Returns results ranked by relevance."
     )]
-    async fn recall(&self, params: Parameters<RecallParams>) -> Result<CallToolResult, McpError> {
+    async fn memory_search(
+        &self,
+        params: Parameters<MemorySearchParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
 
-        // Generate query embedding for vector/hybrid search
         let query_embedding = self.embeddings.embed(&p.query).await.ok();
-
         let mode = if query_embedding.is_some() {
             crate::storage::SearchMode::Hybrid
         } else {
@@ -144,42 +147,152 @@ impl ContextForgeServer {
         )]))
     }
 
-    #[tool(
-        description = "Scan codebase structure (tree-sitter) and git history (gitoxide). Extracts functions, classes, structs, imports, and recent commits."
-    )]
-    async fn scan(&self, params: Parameters<ScanParams>) -> Result<CallToolResult, McpError> {
-        let p = params.0;
-        let root = std::path::PathBuf::from(p.path.as_deref().unwrap_or("."));
-        let patterns = p.patterns.unwrap_or_default();
+    // ── memory_inspect ───────────────────────────────────────────────────
 
-        let mut scanner = CodeScanner::new();
-        let summary = scanner
-            .scan(
-                &root,
-                &patterns,
-                p.include_git,
-                p.max_commits as usize,
-                &self.storage,
+    #[tool(
+        description = "Inspect the knowledge base: view stats, list memories by scope/category, or get a specific memory by ID."
+    )]
+    async fn memory_inspect(
+        &self,
+        params: Parameters<MemoryInspectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+
+        // Get by ID
+        if let Some(id) = &p.id {
+            let memory = self
+                .storage
+                .get_memory(id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            return match memory {
+                Some(m) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&m).unwrap_or_default(),
+                )])),
+                None => Ok(CallToolResult::success(vec![Content::text(format!(
+                    "No memory found with ID: {id}"
+                ))])),
+            };
+        }
+
+        // List or stats
+        let source = p.source.as_deref().unwrap_or("stats");
+
+        match source {
+            "memories" => {
+                let memories = self
+                    .storage
+                    .list_memories(p.scope.as_deref(), p.category.as_deref(), p.limit)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&memories).unwrap_or_default(),
+                )]))
+            }
+            _ => {
+                let stats = self
+                    .storage
+                    .stats()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&stats).unwrap_or_default(),
+                )]))
+            }
+        }
+    }
+
+    // ── memory_update ────────────────────────────────────────────────────
+
+    #[tool(
+        description = "Update an existing memory's content, category, tags, or scope. Provide the memory ID and the fields to change."
+    )]
+    async fn memory_update(
+        &self,
+        params: Parameters<MemoryUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+
+        // Re-embed if content changed
+        let new_embedding = if let Some(content) = &p.content {
+            self.embeddings.embed(content).await.ok()
+        } else {
+            None
+        };
+        let model_id = if new_embedding.is_some() {
+            self.embeddings.model_id().map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        let updated = self
+            .storage
+            .update_memory(
+                &p.id,
+                p.content.as_deref(),
+                p.category.as_deref(),
+                p.tags.as_deref(),
+                p.scope.as_deref(),
+                new_embedding,
+                model_id.as_deref(),
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let response = serde_json::to_string_pretty(&summary)
-            .unwrap_or_else(|_| format!("Scanned {} files", summary.files_scanned));
+        let response = if updated {
+            serde_json::json!({"id": p.id, "status": "updated"})
+        } else {
+            serde_json::json!({"id": p.id, "status": "not_found"})
+        };
 
-        Ok(CallToolResult::success(vec![Content::text(response)]))
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response).unwrap_or_default(),
+        )]))
     }
 
+    // ── memory_forget ────────────────────────────────────────────────────
+
+    #[tool(description = "Delete a memory by ID.")]
+    async fn memory_forget(
+        &self,
+        params: Parameters<MemoryForgetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+
+        let deleted = self
+            .storage
+            .delete_memory(&p.id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let response = if deleted {
+            serde_json::json!({"id": p.id, "status": "deleted"})
+        } else {
+            serde_json::json!({"id": p.id, "status": "not_found"})
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response).unwrap_or_default(),
+        )]))
+    }
+
+    // ── memory_context ───────────────────────────────────────────────────
+
     #[tool(
-        description = "Get unified context: combines memories, code symbols, and git history relevant to your query. Use focus='file' with a target path, focus='recent-changes' for git activity, focus='architecture' for decisions and patterns, or omit for general context."
+        description = "Get unified context about a topic: combines memories, code symbols, and git history. Use focus='architecture' for decisions, focus='recent-changes' for git activity, focus='file' with target path for file details, or omit for general."
     )]
-    async fn context(&self, params: Parameters<ContextParams>) -> Result<CallToolResult, McpError> {
+    async fn memory_context(
+        &self,
+        params: Parameters<MemoryContextParams>,
+    ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         let focus = p.focus.as_deref().unwrap_or("general");
         let target = p.target.as_deref().unwrap_or("");
         let limit = p.limit.min(15);
 
-        // Determine what to query based on focus
         let (mem_limit, sym_limit, git_limit) = match focus {
             "architecture" => (limit, limit * 2, 0),
             "recent-changes" => (2, 3, limit * 2),
@@ -187,7 +300,7 @@ impl ContextForgeServer {
             _ => (limit, limit, limit),
         };
 
-        // 1. Search memories (semantic)
+        // 1. Search memories
         let memories = if mem_limit > 0 && !target.is_empty() {
             let query_embedding = self.embeddings.embed(target).await.ok();
             let mode = if query_embedding.is_some() {
@@ -211,8 +324,8 @@ impl ContextForgeServer {
 
         // 2. Search symbols
         let symbols = if sym_limit > 0 && !target.is_empty() {
-            let is_file_path = target.contains('/') || target.contains('.');
-            if is_file_path {
+            let is_file = target.contains('/') || target.contains('.');
+            if is_file {
                 self.storage
                     .symbols_for_file(target, sym_limit)
                     .await
@@ -227,22 +340,21 @@ impl ContextForgeServer {
             vec![]
         };
 
-        // 3. Search git commits
+        // 3. Search commits
         let commits = if git_limit > 0 {
-            let query = if target.is_empty() {
+            let q = if target.is_empty() {
                 None
             } else {
                 Some(target)
             };
             self.storage
-                .recent_commits(query, git_limit)
+                .recent_commits(q, git_limit)
                 .await
                 .unwrap_or_default()
         } else {
             vec![]
         };
 
-        // Build summary
         let summary = format!(
             "Found {} memories, {} symbols, {} commits{}",
             memories.len(),
@@ -257,13 +369,7 @@ impl ContextForgeServer {
 
         let mem_json: Vec<serde_json::Value> = memories
             .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "content": r.memory.content,
-                    "category": r.memory.category,
-                    "score": r.score,
-                })
-            })
+            .map(|r| serde_json::json!({"content": r.memory.content, "category": r.memory.category, "score": r.score}))
             .collect();
 
         let response = serde_json::json!({
@@ -275,6 +381,93 @@ impl ContextForgeServer {
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&response).unwrap_or(summary),
+        )]))
+    }
+
+    // ── memory_session_start ─────────────────────────────────────────────
+
+    #[tool(
+        description = "Start a work session. Tracks what you save during the session for automatic summarization."
+    )]
+    async fn memory_session_start(
+        &self,
+        params: Parameters<MemorySessionStartParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let scope = p.scope.unwrap_or_else(detect_project_scope);
+
+        let session_id = self
+            .storage
+            .create_session(&scope, p.description.as_deref())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let response = serde_json::json!({
+            "session_id": session_id,
+            "scope": scope,
+            "status": "started",
+            "description": p.description,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response).unwrap_or_default(),
+        )]))
+    }
+
+    // ── memory_session_end ───────────────────────────────────────────────
+
+    #[tool(
+        description = "End the current work session. Generates a summary of all memories saved during the session."
+    )]
+    async fn memory_session_end(
+        &self,
+        params: Parameters<MemorySessionEndParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let scope = detect_project_scope();
+
+        let result = self
+            .storage
+            .end_session(&scope, p.notes.as_deref())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match result {
+            Some(summary) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&summary).unwrap_or_default(),
+            )])),
+            None => Ok(CallToolResult::success(vec![Content::text(
+                "No active session found for this project.",
+            )])),
+        }
+    }
+
+    // ── memory_session_summary ───────────────────────────────────────────
+
+    #[tool(
+        description = "View session summaries. Use period='today', 'week', 'month' to filter. Shows what was accomplished in each session."
+    )]
+    async fn memory_session_summary(
+        &self,
+        params: Parameters<MemorySessionSummaryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let scope = detect_project_scope();
+
+        let sessions = self
+            .storage
+            .get_sessions(&scope, p.period.as_deref())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        if sessions.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No sessions found for this period.",
+            )]));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&sessions).unwrap_or_default(),
         )]))
     }
 }

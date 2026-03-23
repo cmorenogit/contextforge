@@ -1,9 +1,13 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-/// Parameters for the `recall` tool.
+fn default_limit() -> u32 {
+    10
+}
+
+/// Parameters for the `memory_search` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct RecallParams {
+pub struct MemorySearchParams {
     /// Search query — natural language or keywords
     pub query: String,
     /// Maximum number of results to return
@@ -12,8 +16,4 @@ pub struct RecallParams {
     /// Filter by category
     #[serde(default)]
     pub category: Option<String>,
-}
-
-fn default_limit() -> u32 {
-    10
 }

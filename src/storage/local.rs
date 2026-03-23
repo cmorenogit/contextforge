@@ -761,6 +761,436 @@ impl LocalStorage {
         }
         Ok(results)
     }
+
+    // --- memory_inspect methods ---
+
+    /// Get a single memory by ID.
+    pub async fn get_memory(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, content, category, files, tags, scope, embedding_model, created_at \
+                 FROM memories WHERE id = ?1",
+                libsql::params![id],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let id: String = row.get(0).unwrap_or_default();
+            let content: String = row.get(1).unwrap_or_default();
+            let category: Option<String> = row.get(2).ok();
+            let files: Option<String> = row.get(3).ok();
+            let tags: Option<String> = row.get(4).ok();
+            let scope: Option<String> = row.get(5).ok();
+            let model: Option<String> = row.get(6).ok();
+            let created_at: String = row.get(7).unwrap_or_default();
+
+            Ok(Some(serde_json::json!({
+                "id": id,
+                "content": content,
+                "category": category,
+                "files": files.and_then(|f| serde_json::from_str::<Vec<String>>(&f).ok()),
+                "tags": tags.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()),
+                "scope": scope,
+                "embedding_model": model,
+                "created_at": created_at,
+            })))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List memories with optional filters.
+    pub async fn list_memories(
+        &self,
+        scope: Option<&str>,
+        category: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut conditions = Vec::new();
+        let mut param_values: Vec<libsql::Value> = Vec::new();
+        let mut idx = 1;
+
+        if let Some(s) = scope {
+            conditions.push(format!("scope = ?{idx}"));
+            param_values.push(s.to_string().into());
+            idx += 1;
+        }
+        if let Some(c) = category {
+            conditions.push(format!("category = ?{idx}"));
+            param_values.push(c.to_string().into());
+            idx += 1;
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        param_values.push((limit as i64).into());
+        let sql = format!(
+            "SELECT id, content, category, scope, created_at FROM memories \
+             {where_clause} ORDER BY created_at DESC LIMIT ?{idx}"
+        );
+
+        let mut rows = self
+            .conn
+            .query(&sql, libsql::params_from_iter(param_values))
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let id: String = row.get(0).unwrap_or_default();
+            let content: String = row.get(1).unwrap_or_default();
+            let category: Option<String> = row.get(2).ok();
+            let scope: Option<String> = row.get(3).ok();
+            let created_at: String = row.get(4).unwrap_or_default();
+
+            results.push(serde_json::json!({
+                "id": id,
+                "content": content,
+                "category": category,
+                "scope": scope,
+                "created_at": created_at,
+            }));
+        }
+        Ok(results)
+    }
+
+    /// Get stats overview.
+    pub async fn stats(&self) -> Result<serde_json::Value> {
+        let mem_count = self.count(None).await?;
+
+        let mut scope_rows = self
+            .conn
+            .query(
+                "SELECT COALESCE(scope, 'global') as s, COUNT(*) FROM memories GROUP BY s",
+                (),
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let mut by_scope = serde_json::Map::new();
+        while let Some(row) = scope_rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let scope: String = row.get(0).unwrap_or_default();
+            let count: i64 = row.get(1).unwrap_or_default();
+            by_scope.insert(scope, serde_json::json!(count));
+        }
+
+        let mut cat_rows = self
+            .conn
+            .query(
+                "SELECT COALESCE(category, 'uncategorized') as c, COUNT(*) FROM memories GROUP BY c",
+                (),
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let mut by_category = serde_json::Map::new();
+        while let Some(row) = cat_rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let cat: String = row.get(0).unwrap_or_default();
+            let count: i64 = row.get(1).unwrap_or_default();
+            by_category.insert(cat, serde_json::json!(count));
+        }
+
+        let sym_count: i64 = {
+            let mut r = self
+                .conn
+                .query("SELECT COUNT(*) FROM code_symbols", ())
+                .await
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            r.next()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.get(0).ok())
+                .unwrap_or(0)
+        };
+
+        let commit_count: i64 = {
+            let mut r = self
+                .conn
+                .query("SELECT COUNT(*) FROM git_commits", ())
+                .await
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            r.next()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.get(0).ok())
+                .unwrap_or(0)
+        };
+
+        Ok(serde_json::json!({
+            "memories": mem_count,
+            "code_symbols": sym_count,
+            "git_commits": commit_count,
+            "by_scope": by_scope,
+            "by_category": by_category,
+        }))
+    }
+
+    // --- memory_update method ---
+
+    /// Update a memory's content, category, tags, or scope.
+    pub async fn update_memory(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        category: Option<&str>,
+        tags: Option<&[String]>,
+        scope: Option<&str>,
+        new_embedding: Option<Vec<f32>>,
+        embedding_model: Option<&str>,
+    ) -> Result<bool> {
+        let mut updates = Vec::new();
+        let mut params: Vec<libsql::Value> = Vec::new();
+        let mut idx = 1;
+
+        if let Some(c) = content {
+            updates.push(format!("content = ?{idx}"));
+            params.push(c.to_string().into());
+            idx += 1;
+        }
+        if let Some(c) = category {
+            updates.push(format!("category = ?{idx}"));
+            params.push(c.to_string().into());
+            idx += 1;
+        }
+        if let Some(t) = tags {
+            let tags_json =
+                serde_json::to_string(t).map_err(|e| ContextForgeError::Storage(e.to_string()))?;
+            updates.push(format!("tags = ?{idx}"));
+            params.push(tags_json.into());
+            idx += 1;
+        }
+        if let Some(s) = scope {
+            updates.push(format!("scope = ?{idx}"));
+            params.push(s.to_string().into());
+            idx += 1;
+        }
+        if let Some(emb) = &new_embedding {
+            let vec_str = format!(
+                "[{}]",
+                emb.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            updates.push(format!("embedding = vector32(?{idx})"));
+            params.push(vec_str.into());
+            idx += 1;
+        }
+        if let Some(m) = embedding_model {
+            updates.push(format!("embedding_model = ?{idx}"));
+            params.push(m.to_string().into());
+            idx += 1;
+        }
+
+        if updates.is_empty() {
+            return Ok(false);
+        }
+
+        params.push(id.to_string().into());
+        let sql = format!(
+            "UPDATE memories SET {} WHERE id = ?{idx}",
+            updates.join(", ")
+        );
+
+        let rows_affected = self
+            .conn
+            .execute(&sql, libsql::params_from_iter(params))
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        Ok(rows_affected > 0)
+    }
+
+    // --- memory_forget method ---
+
+    /// Delete a memory by ID.
+    pub async fn delete_memory(&self, id: &str) -> Result<bool> {
+        let rows = self
+            .conn
+            .execute("DELETE FROM memories WHERE id = ?1", libsql::params![id])
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    // --- Session methods ---
+
+    /// Create a new session. Closes any active session first.
+    pub async fn create_session(&self, scope: &str, description: Option<&str>) -> Result<String> {
+        // Close active session if any
+        self.conn
+            .execute(
+                "UPDATE sessions SET ended_at = datetime('now') WHERE scope = ?1 AND ended_at IS NULL",
+                libsql::params![scope],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let id = Uuid::new_v4().to_string();
+        self.conn
+            .execute(
+                "INSERT INTO sessions (id, scope, description) VALUES (?1, ?2, ?3)",
+                libsql::params![id.clone(), scope, description],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        Ok(id)
+    }
+
+    /// End the active session for a scope, generating a summary.
+    pub async fn end_session(
+        &self,
+        scope: &str,
+        notes: Option<&str>,
+    ) -> Result<Option<serde_json::Value>> {
+        // Find active session
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, started_at FROM sessions WHERE scope = ?1 AND ended_at IS NULL LIMIT 1",
+                libsql::params![scope],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let (session_id, started_at) = if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let id: String = row.get(0).unwrap_or_default();
+            let started: String = row.get(1).unwrap_or_default();
+            (id, started)
+        } else {
+            return Ok(None);
+        };
+
+        // Get memories created during this session
+        let mut mem_rows = self
+            .conn
+            .query(
+                "SELECT content, category FROM memories \
+                 WHERE (scope = ?1 OR scope = 'global') AND created_at >= ?2 \
+                 ORDER BY created_at ASC",
+                libsql::params![scope, started_at.clone()],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let mut summary_parts = Vec::new();
+        while let Some(row) = mem_rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let content: String = row.get(0).unwrap_or_default();
+            let category: Option<String> = row.get(1).ok();
+            let cat = category.unwrap_or_else(|| "note".into());
+            summary_parts.push(format!("[{cat}] {content}"));
+        }
+
+        if let Some(n) = notes {
+            summary_parts.push(format!("[notes] {n}"));
+        }
+
+        let summary = if summary_parts.is_empty() {
+            "No memories saved during this session.".to_string()
+        } else {
+            summary_parts.join("\n")
+        };
+
+        // Close the session
+        self.conn
+            .execute(
+                "UPDATE sessions SET ended_at = datetime('now'), summary = ?1 WHERE id = ?2",
+                libsql::params![summary.clone(), session_id.clone()],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        Ok(Some(serde_json::json!({
+            "session_id": session_id,
+            "started_at": started_at,
+            "summary": summary,
+            "memories_count": summary_parts.len(),
+        })))
+    }
+
+    /// Get session summaries by period.
+    pub async fn get_sessions(
+        &self,
+        scope: &str,
+        period: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let since = match period {
+            Some("today") => "date('now')",
+            Some("week") => "date('now', '-7 days')",
+            Some("month") => "date('now', '-30 days')",
+            _ => "date('now')", // default to today
+        };
+
+        let sql = format!(
+            "SELECT id, scope, description, started_at, ended_at, summary \
+             FROM sessions WHERE scope = ?1 AND started_at >= {since} \
+             ORDER BY started_at DESC LIMIT 20"
+        );
+
+        let mut rows = self
+            .conn
+            .query(&sql, libsql::params![scope])
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let id: String = row.get(0).unwrap_or_default();
+            let scope: String = row.get(1).unwrap_or_default();
+            let desc: Option<String> = row.get(2).ok();
+            let started: String = row.get(3).unwrap_or_default();
+            let ended: Option<String> = row.get(4).ok();
+            let summary: Option<String> = row.get(5).ok();
+
+            results.push(serde_json::json!({
+                "id": id,
+                "scope": scope,
+                "description": desc,
+                "started_at": started,
+                "ended_at": ended,
+                "summary": summary,
+                "status": if ended.is_some() { "completed" } else { "active" },
+            }));
+        }
+        Ok(results)
+    }
 }
 
 // Hybrid scoring weights

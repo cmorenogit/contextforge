@@ -5,9 +5,9 @@ fn default_max_commits() -> u32 {
     200
 }
 
-/// Parameters for the `scan` tool.
+/// Parameters for the `code_scan` tool (internal, not exposed as MCP tool).
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ScanParams {
+pub struct CodeScanParams {
     /// Directory path to scan (defaults to current working directory)
     #[serde(default)]
     pub path: Option<String>,

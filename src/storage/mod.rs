@@ -42,3 +42,14 @@ pub struct SearchFilter {
     pub mode: SearchMode,
     pub query_embedding: Option<Vec<f32>>,
 }
+
+/// A work session.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub id: String,
+    pub scope: String,
+    pub description: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub summary: Option<String>,
+}

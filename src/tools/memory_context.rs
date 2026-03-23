@@ -5,9 +5,9 @@ fn default_limit() -> u32 {
     5
 }
 
-/// Parameters for the `context` tool.
+/// Parameters for the `memory_context` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ContextParams {
+pub struct MemoryContextParams {
     /// What kind of context: "architecture", "recent-changes", "file", or omit for general
     #[serde(default)]
     pub focus: Option<String>,

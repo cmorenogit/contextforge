@@ -1,9 +1,9 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-/// Parameters for the `remember` tool.
+/// Parameters for the `memory_save` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct RememberParams {
+pub struct MemorySaveParams {
     /// What to remember — a decision, pattern, discovery, or convention
     pub content: String,
     /// Category: decision, pattern, discovery, convention, bugfix

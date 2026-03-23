@@ -77,7 +77,10 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE_FTS_UPDATE_TRIGGER,
     CREATE_CATEGORY_INDEX,
     CREATE_CREATED_AT_INDEX,
-    // V2: code intelligence (CF-03)
+    // V2: sessions (CF-05)
+    CREATE_SESSIONS_TABLE,
+    CREATE_SESSIONS_SCOPE_INDEX,
+    // V3: code intelligence (CF-03)
     CREATE_CODE_SYMBOLS_TABLE,
     CREATE_SYMBOLS_FILE_INDEX,
     CREATE_SYMBOLS_NAME_INDEX,
@@ -93,6 +96,23 @@ pub const ADD_EMBEDDING_MODEL_COLUMN: &str = "ALTER TABLE memories ADD COLUMN em
 
 /// Migration: add scope column to existing databases.
 pub const ADD_SCOPE_COLUMN: &str = "ALTER TABLE memories ADD COLUMN scope TEXT DEFAULT 'global'";
+
+// --- CF-05: Sessions table ---
+
+/// Sessions for tracking work periods.
+pub const CREATE_SESSIONS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    scope       TEXT NOT NULL,
+    description TEXT,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at    TEXT,
+    summary     TEXT
+)
+"#;
+
+pub const CREATE_SESSIONS_SCOPE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_sessions_scope ON sessions(scope)";
 
 // --- CF-03: Code Intelligence tables ---
 
