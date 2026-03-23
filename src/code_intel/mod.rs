@@ -134,7 +134,8 @@ impl CodeScanner {
             .filter_entry(|entry| {
                 if entry.file_type().is_dir() {
                     let name = entry.file_name().to_str().unwrap_or("");
-                    !name.starts_with('.') || name == "." || !SKIP_DIRS.contains(&name)
+                    let is_hidden = name.starts_with('.') && name != ".";
+                    !is_hidden && !SKIP_DIRS.contains(&name)
                 } else {
                     true
                 }
