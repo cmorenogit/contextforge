@@ -1,13 +1,14 @@
 /// Main memories table.
 pub const CREATE_MEMORIES_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS memories (
-    id         TEXT PRIMARY KEY,
-    content    TEXT NOT NULL,
-    category   TEXT,
-    files      TEXT,
-    tags       TEXT,
-    embedding  F32_BLOB(384),
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    id              TEXT PRIMARY KEY,
+    content         TEXT NOT NULL,
+    category        TEXT,
+    files           TEXT,
+    tags            TEXT,
+    embedding       F32_BLOB(384),
+    embedding_model TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 )
 "#;
 
@@ -76,3 +77,7 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE_CATEGORY_INDEX,
     CREATE_CREATED_AT_INDEX,
 ];
+
+/// Migration: add embedding_model column to existing databases.
+pub const ADD_EMBEDDING_MODEL_COLUMN: &str =
+    "ALTER TABLE memories ADD COLUMN embedding_model TEXT";

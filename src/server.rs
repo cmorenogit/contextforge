@@ -47,6 +47,8 @@ impl ContextForgeServer {
             }
         };
 
+        let model_id = self.embeddings.model_id().map(|s| s.to_string());
+
         let memory = self
             .storage
             .store(
@@ -55,6 +57,7 @@ impl ContextForgeServer {
                 p.files.unwrap_or_default(),
                 p.tags.unwrap_or_default(),
                 embedding,
+                model_id.as_deref(),
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;

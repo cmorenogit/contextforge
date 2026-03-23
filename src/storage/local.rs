@@ -39,7 +39,7 @@ impl LocalStorage {
         Ok(Self { db, conn })
     }
 
-    /// Initialize the database schema.
+    /// Initialize the database schema and run pending migrations.
     pub async fn init(&self) -> Result<()> {
         for sql in schema::MIGRATIONS {
             self.conn
@@ -47,10 +47,20 @@ impl LocalStorage {
                 .await
                 .map_err(|e| ContextForgeError::Database(format!("Migration failed: {e}")))?;
         }
+
+        // Migration: add embedding_model column if missing (existing databases)
+        if let Err(_) = self
+            .conn
+            .execute(schema::ADD_EMBEDDING_MODEL_COLUMN, ())
+            .await
+        {
+            // Column already exists — safe to ignore
+        }
+
         Ok(())
     }
 
-    /// Store a new memory.
+    /// Store a new memory with optional embedding and model tracking.
     pub async fn store(
         &self,
         content: String,
@@ -58,6 +68,7 @@ impl LocalStorage {
         files: Vec<String>,
         tags: Vec<String>,
         embedding: Option<Vec<f32>>,
+        embedding_model: Option<&str>,
     ) -> Result<Memory> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -66,6 +77,7 @@ impl LocalStorage {
         let tags_json =
             serde_json::to_string(&tags).map_err(|e| ContextForgeError::Storage(e.to_string()))?;
         let created_at_str = now.to_rfc3339();
+        let model_str = embedding_model.map(|s| s.to_string());
 
         match &embedding {
             Some(emb) => {
@@ -78,8 +90,8 @@ impl LocalStorage {
                 );
                 self.conn
                     .execute(
-                        "INSERT INTO memories (id, content, category, files, tags, embedding, created_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, vector32(?6), ?7)",
+                        "INSERT INTO memories (id, content, category, files, tags, embedding, embedding_model, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, vector32(?6), ?7, ?8)",
                         libsql::params![
                             id.clone(),
                             content.clone(),
@@ -87,6 +99,7 @@ impl LocalStorage {
                             files_json.clone(),
                             tags_json.clone(),
                             vec_str,
+                            model_str.clone(),
                             created_at_str
                         ],
                     )
@@ -96,14 +109,15 @@ impl LocalStorage {
             None => {
                 self.conn
                     .execute(
-                        "INSERT INTO memories (id, content, category, files, tags, embedding, created_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+                        "INSERT INTO memories (id, content, category, files, tags, embedding, embedding_model, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
                         libsql::params![
                             id.clone(),
                             content.clone(),
                             category.clone(),
                             files_json,
                             tags_json,
+                            model_str,
                             created_at_str
                         ],
                     )

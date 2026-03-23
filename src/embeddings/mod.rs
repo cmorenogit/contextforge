@@ -9,69 +9,39 @@ use tokio::sync::OnceCell;
 
 use crate::error::{ContextForgeError, Result};
 
-const MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
-const EMBEDDING_DIM: usize = 384;
+/// Trait for embedding providers — allows swapping models without changing consumers.
+pub trait EmbeddingProvider: Send + Sync {
+    /// Generate an embedding vector from text.
+    fn embed_sync(&self, text: &str) -> Result<Vec<f32>>;
 
-/// Sentence embedding engine using all-MiniLM-L6-v2 via candle.
-pub struct EmbeddingEngine {
+    /// Number of dimensions in the output vector.
+    fn dimension(&self) -> usize;
+
+    /// Identifier for the model (stored in DB for migration tracking).
+    fn model_id(&self) -> &str;
+}
+
+/// Candle-based embedding provider using BERT-family models from HuggingFace.
+pub struct CandleProvider {
     model: BertModel,
     tokenizer: Tokenizer,
+    model_id: String,
+    dimension: usize,
 }
 
 // SAFETY: BertModel contains Tensor fields that are Send when using Device::Cpu.
 // candle_core::Tensor on CPU is backed by a Vec<u8> which is Send.
-unsafe impl Send for EmbeddingEngine {}
-unsafe impl Sync for EmbeddingEngine {}
+unsafe impl Send for CandleProvider {}
+unsafe impl Sync for CandleProvider {}
 
-/// Thread-safe lazy wrapper for the embedding engine.
-#[derive(Clone)]
-pub struct LazyEmbeddingEngine {
-    inner: Arc<OnceCell<EmbeddingEngine>>,
-}
-
-impl LazyEmbeddingEngine {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(OnceCell::new()),
-        }
-    }
-
-    /// Get or initialize the engine, then embed the text.
-    pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let inner = self.inner.clone();
-        inner
-            .get_or_try_init(|| async {
-                tokio::task::spawn_blocking(EmbeddingEngine::load)
-                    .await
-                    .map_err(|e| ContextForgeError::Embedding(format!("Join error: {e}")))?
-            })
-            .await?;
-
-        let text = text.to_string();
-        let inner2 = self.inner.clone();
-        tokio::task::spawn_blocking(move || {
-            let engine = inner2.get().expect("engine initialized above");
-            engine.embed_sync(&text)
-        })
-        .await
-        .map_err(|e| ContextForgeError::Embedding(format!("Join error: {e}")))?
-    }
-}
-
-impl Default for LazyEmbeddingEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl EmbeddingEngine {
-    /// Download model from HF Hub (or load from cache) and initialize.
-    fn load() -> Result<Self> {
+impl CandleProvider {
+    /// Load a sentence-transformer model from HuggingFace Hub (or cache).
+    pub fn load(model_id: &str, dimension: usize) -> Result<Self> {
         let device = Device::Cpu;
 
         let api = Api::new()
             .map_err(|e| ContextForgeError::Embedding(format!("HF Hub API init failed: {e}")))?;
-        let repo = api.model(MODEL_ID.to_string());
+        let repo = api.model(model_id.to_string());
 
         let config_path = repo.get("config.json").map_err(|e| {
             ContextForgeError::Embedding(format!("Failed to download config.json: {e}"))
@@ -98,12 +68,49 @@ impl EmbeddingEngine {
         let model = BertModel::load(vb, &config)
             .map_err(|e| ContextForgeError::Embedding(format!("Build model: {e}")))?;
 
-        tracing::info!("Loaded embedding model {MODEL_ID} ({EMBEDDING_DIM} dims)");
+        tracing::info!("Loaded embedding model {model_id} ({dimension} dims)");
 
-        Ok(Self { model, tokenizer })
+        Ok(Self {
+            model,
+            tokenizer,
+            model_id: model_id.to_string(),
+            dimension,
+        })
     }
 
-    /// Synchronous embedding: tokenize -> forward -> mean pool -> L2 normalize.
+    /// Default: all-MiniLM-L6-v2 (384 dims, fast, good general quality).
+    pub fn default_model() -> Result<Self> {
+        Self::load("sentence-transformers/all-MiniLM-L6-v2", 384)
+    }
+
+    /// Mean pooling with attention mask.
+    fn mean_pooling(
+        token_embeddings: &Tensor,
+        attention_mask: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let mask_expanded = attention_mask
+            .unsqueeze(2)?
+            .broadcast_as(token_embeddings.shape())?;
+
+        let summed = (token_embeddings * &mask_expanded)?.sum(1)?;
+        let mask_sum = mask_expanded.sum(1)?.clamp(1e-9, f64::MAX)?;
+
+        &summed / &mask_sum
+    }
+
+    /// L2 normalize: x / ||x||_2
+    fn l2_normalize(tensor: &Tensor) -> candle_core::Result<Tensor> {
+        let norm = tensor
+            .sqr()?
+            .sum_keepdim(1)?
+            .sqrt()?
+            .clamp(1e-12, f64::MAX)?;
+
+        tensor.broadcast_div(&norm)
+    }
+}
+
+impl EmbeddingProvider for CandleProvider {
     fn embed_sync(&self, text: &str) -> Result<Vec<f32>> {
         let device = &self.model.device;
 
@@ -145,35 +152,69 @@ impl EmbeddingEngine {
             .and_then(|t| t.to_vec1())
             .map_err(|e| ContextForgeError::Embedding(format!("To vec: {e}")))?;
 
-        debug_assert_eq!(embedding.len(), EMBEDDING_DIM);
+        debug_assert_eq!(embedding.len(), self.dimension);
 
         Ok(embedding)
     }
 
-    /// Mean pooling with attention mask.
-    fn mean_pooling(
-        token_embeddings: &Tensor,
-        attention_mask: &Tensor,
-    ) -> candle_core::Result<Tensor> {
-        let mask_expanded = attention_mask
-            .unsqueeze(2)?
-            .broadcast_as(token_embeddings.shape())?;
-
-        let summed = (token_embeddings * &mask_expanded)?.sum(1)?;
-
-        let mask_sum = mask_expanded.sum(1)?.clamp(1e-9, f64::MAX)?;
-
-        &summed / &mask_sum
+    fn dimension(&self) -> usize {
+        self.dimension
     }
 
-    /// L2 normalize: x / ||x||_2
-    fn l2_normalize(tensor: &Tensor) -> candle_core::Result<Tensor> {
-        let norm = tensor
-            .sqr()?
-            .sum_keepdim(1)?
-            .sqrt()?
-            .clamp(1e-12, f64::MAX)?;
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
 
-        tensor.broadcast_div(&norm)
+/// Thread-safe lazy wrapper for any embedding provider.
+#[derive(Clone)]
+pub struct LazyEmbeddingEngine {
+    inner: Arc<OnceCell<Box<dyn EmbeddingProvider>>>,
+}
+
+impl LazyEmbeddingEngine {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(OnceCell::new()),
+        }
+    }
+
+    /// Get or initialize the engine, then embed the text.
+    pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let inner = self.inner.clone();
+        inner
+            .get_or_try_init(|| async {
+                tokio::task::spawn_blocking(|| -> Result<Box<dyn EmbeddingProvider>> {
+                    Ok(Box::new(CandleProvider::default_model()?))
+                })
+                .await
+                .map_err(|e| ContextForgeError::Embedding(format!("Join error: {e}")))?
+            })
+            .await?;
+
+        let text = text.to_string();
+        let inner2 = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = inner2.get().expect("engine initialized above");
+            engine.embed_sync(&text)
+        })
+        .await
+        .map_err(|e| ContextForgeError::Embedding(format!("Join error: {e}")))?
+    }
+
+    /// Get the model ID (returns None if engine not yet initialized).
+    pub fn model_id(&self) -> Option<&str> {
+        self.inner.get().map(|e| e.model_id())
+    }
+
+    /// Get the embedding dimension (returns None if engine not yet initialized).
+    pub fn dimension(&self) -> Option<usize> {
+        self.inner.get().map(|e| e.dimension())
+    }
+}
+
+impl Default for LazyEmbeddingEngine {
+    fn default() -> Self {
+        Self::new()
     }
 }
