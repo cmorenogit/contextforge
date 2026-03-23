@@ -78,9 +78,9 @@ impl CandleProvider {
         })
     }
 
-    /// Default: all-MiniLM-L6-v2 (384 dims, fast, good general quality).
+    /// Default: bge-small-en-v1.5 (384 dims, better quality than MiniLM, same speed).
     pub fn default_model() -> Result<Self> {
-        Self::load("sentence-transformers/all-MiniLM-L6-v2", 384)
+        Self::load("BAAI/bge-small-en-v1.5", 384)
     }
 
     /// Mean pooling with attention mask.
