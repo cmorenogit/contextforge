@@ -1,20 +1,20 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+fn default_limit() -> u32 {
+    5
+}
+
 /// Parameters for the `context` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ContextParams {
-    /// What kind of context is needed (e.g., "architecture", "recent-changes", "related-to")
+    /// What kind of context: "architecture", "recent-changes", "file", or omit for general
     #[serde(default)]
     pub focus: Option<String>,
-    /// File or symbol to get context about
+    /// Topic, file path, or symbol name to get context about
     #[serde(default)]
     pub target: Option<String>,
-    /// Max depth of context traversal
-    #[serde(default = "default_depth")]
-    pub depth: u32,
-}
-
-fn default_depth() -> u32 {
-    3
+    /// Max results per section (default: 5)
+    #[serde(default = "default_limit")]
+    pub limit: u32,
 }

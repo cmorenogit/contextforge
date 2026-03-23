@@ -91,6 +91,9 @@ pub const MIGRATIONS: &[&str] = &[
 /// Migration: add embedding_model column to existing databases.
 pub const ADD_EMBEDDING_MODEL_COLUMN: &str = "ALTER TABLE memories ADD COLUMN embedding_model TEXT";
 
+/// Migration: add scope column to existing databases.
+pub const ADD_SCOPE_COLUMN: &str = "ALTER TABLE memories ADD COLUMN scope TEXT DEFAULT 'global'";
+
 // --- CF-03: Code Intelligence tables ---
 
 /// Code symbols extracted by tree-sitter.

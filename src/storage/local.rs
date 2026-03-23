@@ -48,16 +48,17 @@ impl LocalStorage {
                 .map_err(|e| ContextForgeError::Database(format!("Migration failed: {e}")))?;
         }
 
-        // Migration: add embedding_model column if missing (existing databases)
+        // Migrations for existing databases
         let _ = self
             .conn
             .execute(schema::ADD_EMBEDDING_MODEL_COLUMN, ())
             .await;
+        let _ = self.conn.execute(schema::ADD_SCOPE_COLUMN, ()).await;
 
         Ok(())
     }
 
-    /// Store a new memory with optional embedding and model tracking.
+    /// Store a new memory with optional embedding, model tracking, and scope.
     pub async fn store(
         &self,
         content: String,
@@ -66,6 +67,7 @@ impl LocalStorage {
         tags: Vec<String>,
         embedding: Option<Vec<f32>>,
         embedding_model: Option<&str>,
+        scope: &str,
     ) -> Result<Memory> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -87,8 +89,8 @@ impl LocalStorage {
                 );
                 self.conn
                     .execute(
-                        "INSERT INTO memories (id, content, category, files, tags, embedding, embedding_model, created_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, vector32(?6), ?7, ?8)",
+                        "INSERT INTO memories (id, content, category, files, tags, embedding, embedding_model, scope, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, vector32(?6), ?7, ?8, ?9)",
                         libsql::params![
                             id.clone(),
                             content.clone(),
@@ -97,6 +99,7 @@ impl LocalStorage {
                             tags_json.clone(),
                             vec_str,
                             model_str.clone(),
+                            scope,
                             created_at_str
                         ],
                     )
@@ -106,8 +109,8 @@ impl LocalStorage {
             None => {
                 self.conn
                     .execute(
-                        "INSERT INTO memories (id, content, category, files, tags, embedding, embedding_model, created_at) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+                        "INSERT INTO memories (id, content, category, files, tags, embedding, embedding_model, scope, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
                         libsql::params![
                             id.clone(),
                             content.clone(),
@@ -115,6 +118,7 @@ impl LocalStorage {
                             files_json,
                             tags_json,
                             model_str,
+                            scope,
                             created_at_str
                         ],
                     )
@@ -618,6 +622,144 @@ impl LocalStorage {
                 .map_err(|e| ContextForgeError::Database(e.to_string()))?;
         }
         Ok(())
+    }
+
+    // --- CF-05: Context query methods ---
+
+    /// Search code symbols by name or signature (keyword search).
+    pub async fn search_symbols(&self, query: &str, limit: u32) -> Result<Vec<serde_json::Value>> {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT cs.name, cs.kind, cs.file_path, cs.start_line, cs.end_line, cs.signature \
+                 FROM code_symbols cs \
+                 WHERE cs.name LIKE ?1 OR cs.signature LIKE ?1 \
+                 LIMIT ?2",
+                libsql::params![format!("%{query}%"), limit],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let name: String = row.get(0).unwrap_or_default();
+            let kind: String = row.get(1).unwrap_or_default();
+            let file_path: String = row.get(2).unwrap_or_default();
+            let start_line: i64 = row.get(3).unwrap_or_default();
+            let end_line: i64 = row.get(4).unwrap_or_default();
+            let signature: Option<String> = row.get(5).ok();
+
+            results.push(serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "file": file_path,
+                "lines": format!("{}-{}", start_line, end_line),
+                "signature": signature,
+            }));
+        }
+        Ok(results)
+    }
+
+    /// Search symbols by file path.
+    pub async fn symbols_for_file(
+        &self,
+        file_path: &str,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT name, kind, start_line, end_line, signature \
+                 FROM code_symbols WHERE file_path LIKE ?1 \
+                 ORDER BY start_line LIMIT ?2",
+                libsql::params![format!("%{file_path}%"), limit],
+            )
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let name: String = row.get(0).unwrap_or_default();
+            let kind: String = row.get(1).unwrap_or_default();
+            let start_line: i64 = row.get(2).unwrap_or_default();
+            let end_line: i64 = row.get(3).unwrap_or_default();
+            let signature: Option<String> = row.get(4).ok();
+
+            results.push(serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "lines": format!("{}-{}", start_line, end_line),
+                "signature": signature,
+            }));
+        }
+        Ok(results)
+    }
+
+    /// Get recent git commits, optionally filtered by keyword.
+    pub async fn recent_commits(
+        &self,
+        query: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut rows = match query {
+            Some(q) => {
+                self.conn
+                    .query(
+                        "SELECT hash, message, author, committed_at, commit_type, scope \
+                         FROM git_commits WHERE message LIKE ?1 \
+                         ORDER BY committed_at DESC LIMIT ?2",
+                        libsql::params![format!("%{q}%"), limit],
+                    )
+                    .await
+            }
+            None => {
+                self.conn
+                    .query(
+                        "SELECT hash, message, author, committed_at, commit_type, scope \
+                         FROM git_commits ORDER BY committed_at DESC LIMIT ?1",
+                        libsql::params![limit],
+                    )
+                    .await
+            }
+        }
+        .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let hash: String = row.get(0).unwrap_or_default();
+            let message: String = row.get(1).unwrap_or_default();
+            let author: String = row.get(2).unwrap_or_default();
+            let committed_at: String = row.get(3).unwrap_or_default();
+            let commit_type: Option<String> = row.get(4).ok();
+            let scope: Option<String> = row.get(5).ok();
+
+            results.push(serde_json::json!({
+                "hash": &hash[..7.min(hash.len())],
+                "message": message,
+                "author": author,
+                "date": committed_at,
+                "type": commit_type,
+                "scope": scope,
+            }));
+        }
+        Ok(results)
     }
 }
 

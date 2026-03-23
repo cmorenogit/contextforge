@@ -15,4 +15,7 @@ pub struct RememberParams {
     /// Tags for additional categorization
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Scope: "global" (cross-project) or "project" (current project only). Default: auto-detected.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
