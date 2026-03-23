@@ -7,6 +7,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
+use crate::embeddings::LazyEmbeddingEngine;
 use crate::storage::local::LocalStorage;
 use crate::tools::{ContextParams, RecallParams, RememberParams, ScanParams};
 
@@ -14,6 +15,7 @@ use crate::tools::{ContextParams, RecallParams, RememberParams, ScanParams};
 pub struct ContextForgeServer {
     tool_router: ToolRouter<Self>,
     storage: Arc<LocalStorage>,
+    embeddings: LazyEmbeddingEngine,
 }
 
 #[tool_router]
@@ -23,17 +25,28 @@ impl ContextForgeServer {
         Self {
             tool_router: Self::tool_router(),
             storage,
+            embeddings: LazyEmbeddingEngine::new(),
         }
     }
 
     #[tool(
-        description = "Remember a decision, pattern, or discovery. Stores it with full-text indexing for later recall."
+        description = "Remember a decision, pattern, or discovery. Stores it with semantic embedding for later recall."
     )]
     async fn remember(
         &self,
         params: Parameters<RememberParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+
+        // Generate embedding (graceful degradation: store without if it fails)
+        let embedding = match self.embeddings.embed(&p.content).await {
+            Ok(emb) => Some(emb),
+            Err(e) => {
+                tracing::warn!("Embedding generation failed, storing without vector: {e}");
+                None
+            }
+        };
+
         let memory = self
             .storage
             .store(
@@ -41,7 +54,7 @@ impl ContextForgeServer {
                 p.category,
                 p.files.unwrap_or_default(),
                 p.tags.unwrap_or_default(),
-                None, // Embeddings deferred to CF-04
+                embedding,
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -65,10 +78,21 @@ impl ContextForgeServer {
     )]
     async fn recall(&self, params: Parameters<RecallParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
+
+        // Generate query embedding for vector/hybrid search
+        let query_embedding = self.embeddings.embed(&p.query).await.ok();
+
+        let mode = if query_embedding.is_some() {
+            crate::storage::SearchMode::Hybrid
+        } else {
+            crate::storage::SearchMode::Keyword
+        };
+
         let filter = crate::storage::SearchFilter {
             category: p.category,
             limit: p.limit,
-            mode: crate::storage::SearchMode::Keyword,
+            mode,
+            query_embedding,
         };
 
         let results = self

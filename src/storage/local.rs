@@ -123,20 +123,158 @@ impl LocalStorage {
         })
     }
 
-    /// Search memories. Currently keyword-only; vector and hybrid added in CF-04.
+    /// Search memories using keyword, vector, or hybrid mode.
     pub async fn search(&self, query: &str, filter: SearchFilter) -> Result<Vec<SearchResult>> {
         let limit = if filter.limit == 0 { 10 } else { filter.limit };
 
         match filter.mode {
-            SearchMode::Keyword | SearchMode::Hybrid => {
+            SearchMode::Keyword => {
                 self.search_keyword(query, filter.category.as_deref(), limit)
                     .await
             }
-            SearchMode::Vector => {
-                // Vector search requires embeddings — defer to CF-04
-                Ok(vec![])
-            }
+            SearchMode::Vector => match &filter.query_embedding {
+                Some(emb) => {
+                    self.search_vector(emb, filter.category.as_deref(), limit)
+                        .await
+                }
+                None => Ok(vec![]),
+            },
+            SearchMode::Hybrid => match &filter.query_embedding {
+                Some(emb) => {
+                    self.search_hybrid(query, emb, filter.category.as_deref(), limit)
+                        .await
+                }
+                None => {
+                    self.search_keyword(query, filter.category.as_deref(), limit)
+                        .await
+                }
+            },
         }
+    }
+
+    /// Vector similarity search using libSQL's DiskANN index.
+    async fn search_vector(
+        &self,
+        embedding: &[f32],
+        category: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SearchResult>> {
+        let vec_str = format!(
+            "[{}]",
+            embedding
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let rows = match category {
+            Some(cat) => self
+                .conn
+                .query(
+                    "SELECT m.id, m.content, m.category, m.files, m.tags, m.created_at, v.distance \
+                         FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) v \
+                         JOIN memories m ON m.rowid = v.id \
+                         WHERE m.category = ?3",
+                    libsql::params![vec_str, limit, cat.to_string()],
+                )
+                .await
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?,
+            None => self
+                .conn
+                .query(
+                    "SELECT m.id, m.content, m.category, m.files, m.tags, m.created_at, v.distance \
+                         FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) v \
+                         JOIN memories m ON m.rowid = v.id",
+                    libsql::params![vec_str, limit],
+                )
+                .await
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?,
+        };
+
+        self.parse_search_rows_distance(rows).await
+    }
+
+    /// Hybrid search: FTS5 keyword + vector similarity, merged via Reciprocal Rank Fusion.
+    async fn search_hybrid(
+        &self,
+        query: &str,
+        embedding: &[f32],
+        category: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SearchResult>> {
+        let candidate_limit = limit * 3;
+
+        let keyword_results = self
+            .search_keyword(query, category, candidate_limit)
+            .await?;
+        let vector_results = self
+            .search_vector(embedding, category, candidate_limit)
+            .await?;
+
+        Ok(rrf_merge(&keyword_results, &vector_results, limit as usize))
+    }
+
+    /// Parse rows with distance column (vector search).
+    async fn parse_search_rows_distance(
+        &self,
+        mut rows: libsql::Rows,
+    ) -> Result<Vec<SearchResult>> {
+        let mut results = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| ContextForgeError::Database(e.to_string()))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            let content: String = row
+                .get(1)
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            let category: Option<String> = row
+                .get(2)
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            let files_json: Option<String> = row
+                .get(3)
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            let tags_json: Option<String> = row
+                .get(4)
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            let created_at_str: String = row
+                .get(5)
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+            let distance: f64 = row
+                .get(6)
+                .map_err(|e| ContextForgeError::Database(e.to_string()))?;
+
+            let files: Vec<String> = files_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let tags: Vec<String> = tags_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            results.push(SearchResult {
+                memory: Memory {
+                    id,
+                    content,
+                    category,
+                    files,
+                    tags,
+                    embedding: None,
+                    created_at,
+                },
+                score: 1.0 - distance, // Cosine distance to similarity
+            });
+        }
+
+        Ok(results)
     }
 
     /// FTS5 keyword search.
@@ -348,6 +486,68 @@ impl LocalStorage {
             Ok(0)
         }
     }
+}
+
+// RRF constants
+const RRF_K: f64 = 60.0;
+const KEYWORD_WEIGHT: f64 = 0.4;
+const VECTOR_WEIGHT: f64 = 0.6;
+
+/// Reciprocal Rank Fusion: merge keyword and vector search results.
+/// score(doc) = 0.4/(k+kw_rank) + 0.6/(k+vec_rank), k=60
+fn rrf_merge(
+    keyword_results: &[SearchResult],
+    vector_results: &[SearchResult],
+    limit: usize,
+) -> Vec<SearchResult> {
+    use std::collections::HashMap;
+
+    let mut kw_ranks: HashMap<&str, usize> = HashMap::new();
+    for (rank, r) in keyword_results.iter().enumerate() {
+        kw_ranks.insert(&r.memory.id, rank + 1);
+    }
+
+    let mut vec_ranks: HashMap<&str, usize> = HashMap::new();
+    for (rank, r) in vector_results.iter().enumerate() {
+        vec_ranks.insert(&r.memory.id, rank + 1);
+    }
+
+    // Collect all unique memories
+    let mut memories: HashMap<&str, &Memory> = HashMap::new();
+    for r in keyword_results {
+        memories.insert(&r.memory.id, &r.memory);
+    }
+    for r in vector_results {
+        memories.entry(&r.memory.id).or_insert(&r.memory);
+    }
+
+    // Compute RRF scores
+    let mut scored: Vec<(&str, f64)> = memories
+        .keys()
+        .map(|id| {
+            let mut score = 0.0;
+            if let Some(&rank) = kw_ranks.get(id) {
+                score += KEYWORD_WEIGHT / (RRF_K + rank as f64);
+            }
+            if let Some(&rank) = vec_ranks.get(id) {
+                score += VECTOR_WEIGHT / (RRF_K + rank as f64);
+            }
+            (*id, score)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+
+    scored
+        .into_iter()
+        .filter_map(|(id, score)| {
+            memories.get(id).map(|mem| SearchResult {
+                memory: (*mem).clone(),
+                score,
+            })
+        })
+        .collect()
 }
 
 /// Sanitize user input for FTS5 MATCH syntax.

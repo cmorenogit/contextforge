@@ -40,4 +40,5 @@ pub struct SearchFilter {
     pub category: Option<String>,
     pub limit: u32,
     pub mode: SearchMode,
+    pub query_embedding: Option<Vec<f32>>,
 }
