@@ -1,0 +1,12 @@
+[package]
+name = "contextforge"
+version = "0.1.0"
+edition = "2024"
+description = "Persistent semantic memory for AI coding assistants — MCP server"
+authors = ["Cesar Moreno <cesar@cesarmoreno.dev>"]
+license = "MIT"
+repository = "https://github.com/cesarmoreno/contextforge"
+keywords = ["mcp", "ai", "memory", "embeddings", "coding-assistant"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
