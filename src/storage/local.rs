@@ -168,14 +168,18 @@ impl LocalStorage {
                 .join(",")
         );
 
+        // vector_top_k returns rows ordered by similarity, but no distance column.
+        // Use vector_distance_cos() to compute actual cosine distance on the narrowed result set.
         let rows = match category {
             Some(cat) => self
                 .conn
                 .query(
-                    "SELECT m.id, m.content, m.category, m.files, m.tags, m.created_at, v.distance \
+                    "SELECT m.id, m.content, m.category, m.files, m.tags, m.created_at, \
+                         vector_distance_cos(m.embedding, vector32(?1)) AS distance \
                          FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) v \
                          JOIN memories m ON m.rowid = v.id \
-                         WHERE m.category = ?3",
+                         WHERE m.category = ?3 \
+                         ORDER BY distance ASC",
                     libsql::params![vec_str, limit, cat.to_string()],
                 )
                 .await
@@ -183,16 +187,18 @@ impl LocalStorage {
             None => self
                 .conn
                 .query(
-                    "SELECT m.id, m.content, m.category, m.files, m.tags, m.created_at, v.distance \
+                    "SELECT m.id, m.content, m.category, m.files, m.tags, m.created_at, \
+                         vector_distance_cos(m.embedding, vector32(?1)) AS distance \
                          FROM vector_top_k('memories_vec_idx', vector32(?1), ?2) v \
-                         JOIN memories m ON m.rowid = v.id",
+                         JOIN memories m ON m.rowid = v.id \
+                         ORDER BY distance ASC",
                     libsql::params![vec_str, limit],
                 )
                 .await
                 .map_err(|e| ContextForgeError::Database(e.to_string()))?,
         };
 
-        self.parse_search_rows_distance(rows).await
+        self.parse_search_rows_with_distance(rows).await
     }
 
     /// Hybrid search: FTS5 keyword + vector similarity, merged via Reciprocal Rank Fusion.
@@ -215,8 +221,9 @@ impl LocalStorage {
         Ok(rrf_merge(&keyword_results, &vector_results, limit as usize))
     }
 
-    /// Parse rows with distance column (vector search).
-    async fn parse_search_rows_distance(
+    /// Parse rows from vector search with actual cosine distance scores.
+    /// Cosine distance: 0 = identical, 2 = opposite. Converted to similarity: 1.0 - distance.
+    async fn parse_search_rows_with_distance(
         &self,
         mut rows: libsql::Rows,
     ) -> Result<Vec<SearchResult>> {
@@ -270,7 +277,7 @@ impl LocalStorage {
                     embedding: None,
                     created_at,
                 },
-                score: 1.0 - distance, // Cosine distance to similarity
+                score: 1.0 - distance, // Convert cosine distance to similarity
             });
         }
 
@@ -488,13 +495,12 @@ impl LocalStorage {
     }
 }
 
-// RRF constants
-const RRF_K: f64 = 60.0;
+// Hybrid scoring weights
 const KEYWORD_WEIGHT: f64 = 0.4;
 const VECTOR_WEIGHT: f64 = 0.6;
 
-/// Reciprocal Rank Fusion: merge keyword and vector search results.
-/// score(doc) = 0.4/(k+kw_rank) + 0.6/(k+vec_rank), k=60
+/// Merge keyword and vector search results using weighted score combination.
+/// Uses real scores from both sources: FTS5 BM25 (normalized) + cosine similarity.
 fn rrf_merge(
     keyword_results: &[SearchResult],
     vector_results: &[SearchResult],
@@ -502,15 +508,28 @@ fn rrf_merge(
 ) -> Vec<SearchResult> {
     use std::collections::HashMap;
 
-    let mut kw_ranks: HashMap<&str, usize> = HashMap::new();
-    for (rank, r) in keyword_results.iter().enumerate() {
-        kw_ranks.insert(&r.memory.id, rank + 1);
-    }
+    // Normalize keyword scores to [0, 1] range
+    let max_kw_score = keyword_results
+        .iter()
+        .map(|r| r.score)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let kw_scores: HashMap<&str, f64> = keyword_results
+        .iter()
+        .map(|r| {
+            let normalized = if max_kw_score > 0.0 {
+                r.score / max_kw_score
+            } else {
+                0.0
+            };
+            (r.memory.id.as_str(), normalized)
+        })
+        .collect();
 
-    let mut vec_ranks: HashMap<&str, usize> = HashMap::new();
-    for (rank, r) in vector_results.iter().enumerate() {
-        vec_ranks.insert(&r.memory.id, rank + 1);
-    }
+    // Vector scores are already cosine similarity in [0, 1]
+    let vec_scores: HashMap<&str, f64> = vector_results
+        .iter()
+        .map(|r| (r.memory.id.as_str(), r.score.max(0.0)))
+        .collect();
 
     // Collect all unique memories
     let mut memories: HashMap<&str, &Memory> = HashMap::new();
@@ -521,17 +540,13 @@ fn rrf_merge(
         memories.entry(&r.memory.id).or_insert(&r.memory);
     }
 
-    // Compute RRF scores
+    // Compute weighted scores
     let mut scored: Vec<(&str, f64)> = memories
         .keys()
         .map(|id| {
-            let mut score = 0.0;
-            if let Some(&rank) = kw_ranks.get(id) {
-                score += KEYWORD_WEIGHT / (RRF_K + rank as f64);
-            }
-            if let Some(&rank) = vec_ranks.get(id) {
-                score += VECTOR_WEIGHT / (RRF_K + rank as f64);
-            }
+            let kw = kw_scores.get(id).copied().unwrap_or(0.0);
+            let vec = vec_scores.get(id).copied().unwrap_or(0.0);
+            let score = KEYWORD_WEIGHT * kw + VECTOR_WEIGHT * vec;
             (*id, score)
         })
         .collect();
