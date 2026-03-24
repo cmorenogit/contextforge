@@ -37,7 +37,16 @@ unsafe impl Sync for CandleProvider {}
 impl CandleProvider {
     /// Load a sentence-transformer model from HuggingFace Hub (or cache).
     pub fn load(model_id: &str, dimension: usize) -> Result<Self> {
-        let device = Device::Cpu;
+        let device = match Device::new_metal(0) {
+            Ok(d) => {
+                tracing::info!("Using Metal GPU for embeddings");
+                d
+            }
+            Err(e) => {
+                tracing::info!("Metal GPU not available ({e}), falling back to CPU");
+                Device::Cpu
+            }
+        };
 
         let api = Api::new()
             .map_err(|e| ContextForgeError::Embedding(format!("HF Hub API init failed: {e}")))?;
